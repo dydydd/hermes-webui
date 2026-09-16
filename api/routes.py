@@ -6575,19 +6575,24 @@ def _stored_provider_can_legitimately_own_model(
             return True
         # PR #7594 review P1 follow-up: a profile may declare the local endpoint at
         # the TOP level (FAQ-documented shape ``model: {provider: ..., base_url:
-        # http://127.0.0.1:...}``) rather than nested under ``providers.<id>``. An
-        # arbitrary provider ID routed through a loopback/private base_url with no
-        # key and no catalog group is a legitimate local-server lane and must not be
-        # cleared. Public relay-style URLs are intentionally NOT covered here so a
-        # missing catalog group on a public endpoint still reassigns to the
-        # catalog owner (boundary guard).
+        # http://127.0.0.1:...}``) rather than nested under ``providers.<id>``. The
+        # top-level URL is ownership evidence ONLY for its configured
+        # ``model.provider``: a loopback/private URL configured for provider X must
+        # not protect an unrelated stored provider Y from the stale repair (Greptile
+        # P1). A missing ``model.provider`` therefore evidences nobody; public
+        # relay-style URLs stay non-evidence (boundary guard).
         try:
             from api.config import _base_url_points_at_local_server
 
             model_cfg = profile_config.get("model")
             if isinstance(model_cfg, dict):
+                configured_provider = str(model_cfg.get("provider") or "").strip().lower()
                 top_base_url = str(model_cfg.get("base_url") or "").strip()
-                if top_base_url and _base_url_points_at_local_server(top_base_url):
+                if (
+                    configured_provider == provider
+                    and top_base_url
+                    and _base_url_points_at_local_server(top_base_url)
+                ):
                     return True
         except Exception:
             return True
