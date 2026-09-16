@@ -6537,20 +6537,42 @@ def _catalog_group_owns_exact_model(group: dict, model: str) -> bool:
     return False
 
 
-def _stored_provider_can_legitimately_own_model(stored_provider: str) -> bool:
+def _stored_provider_can_legitimately_own_model(
+    stored_provider: str, profile_config: dict | None = None
+) -> bool:
     """Return True when a catalog absence is not evidence against ownership.
 
-    Self-hosted, plugin, and custom-endpoint providers serve arbitrary
-    local/external models that never appear in any catalog (vLLM or
-    llama-server behind a named ``custom_providers`` entry need no API key),
-    so a missing model there does not prove the stored provider is stale
-    (#7585 review; #5731 fail-safe).
+    Self-hosted, local-server, plugin, and custom-endpoint providers serve
+    arbitrary local/external models that never appear in any catalog (vLLM,
+    llama.cpp, TabbyAPI, or llama-server behind a named ``custom_providers``
+    entry need no API key), so a missing model there does not prove the
+    stored provider is stale (#7585 review; #5731 fail-safe). A profile that
+    configures ``providers.<id>.base_url`` likewise declares that the OpenAI-
+    compatible endpoint owns its models regardless of catalog/key presence
+    (PR #7594 review, CORE). Every lookup keeps an ``except: return True``
+    fail-safe so an unexpected config shape never clears a lane.
     """
     provider = str(stored_provider or "").strip().lower()
     if provider in _SELF_HOSTED_PROVIDER_IDS:
         return True
     if provider == "custom" or provider.startswith("custom:"):
         return True
+    try:
+        from api.config import _is_local_server_provider
+
+        if _is_local_server_provider(provider):
+            return True
+    except Exception:
+        return True
+    if provider and isinstance(profile_config, dict):
+        try:
+            providers_cfg = profile_config.get("providers")
+            if isinstance(providers_cfg, dict):
+                entry = providers_cfg.get(provider)
+                if isinstance(entry, dict) and str(entry.get("base_url") or "").strip():
+                    return True
+        except Exception:
+            return True
     try:
         from api.config import _named_custom_provider_slug_for_provider
 
@@ -6595,6 +6617,7 @@ def _repair_foreign_session_model_provider(
     resolved_provider: str | None,
     explicit_model_pick: bool,
     profile_provider: str | None,
+    profile_config: dict | None = None,
 ) -> str | None:
     """Repair a stale provider only when the cached catalog names one owner."""
     stored_model = str(getattr(session, "model", "") or "").strip()
@@ -6648,7 +6671,7 @@ def _repair_foreign_session_model_provider(
         # complete catalog evidence proves non-ownership. Self-hosted/plugin
         # providers may legitimately own unlisted models, and an incomplete
         # or credential-live stored lane stays fail-safe preserved (#5731).
-        if _stored_provider_can_legitimately_own_model(stored_provider):
+        if _stored_provider_can_legitimately_own_model(stored_provider, profile_config):
             return resolved_provider
         if _catalog_evidence_is_incomplete(catalog, groups):
             return resolved_provider
@@ -24372,6 +24395,7 @@ def _handle_chat_start(handler, body, diag=None):
             resolved_provider=model_provider,
             explicit_model_pick=explicit_model_pick,
             profile_provider=catalog_profile_provider,
+            profile_config=_pp_cfg,
         )
         if model_provider == "moa" and gateway_chat_enabled:
             from api.config import get_effective_default_model
