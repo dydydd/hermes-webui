@@ -158,3 +158,34 @@ def test_chat_start_no_longer_routes_agent_through_stale_paid_lane(
     assert captured["model_provider"] == "nous", captured["model_provider"]
     assert session.model == "deepseek/deepseek-v4.1-flash"
     assert session.model_provider == "nous"
+
+
+def test_minimal_fallback_catalog_stays_preserved(
+    monkeypatch, no_openrouter_credential, no_plugin_providers
+):
+    """A cold/emergency minimal catalog is not complete discovery evidence.
+
+    The fallback lists only the active provider's default model; treating it
+    as a full catalog could reassign the session to the wrong owner when
+    other configured providers were merely omitted (PR #7594 review).
+    """
+    minimal = _catalog(_group("nous", "deepseek/deepseek-v4.1-flash"))
+    minimal["catalog_minimal"] = True
+    _patch_catalog(monkeypatch, minimal)
+
+    assert _repair(_session()) == "openrouter"
+
+
+def test_keyless_custom_endpoint_provider_stays_preserved(
+    monkeypatch, no_openrouter_credential, no_plugin_providers
+):
+    """custom:<slug> lanes (vLLM, llama-server) need no API key.
+
+    A missing catalog group proves nothing for them: absence of a key must
+    not be read as proof of staleness (PR #7594 review).
+    """
+    monkeypatch.setattr(routes, "provider_has_usable_credential", lambda _pid, **_kw: False, raising=False)
+    _patch_catalog(monkeypatch, _catalog(_group("nous", "vendor/local-model")))
+    session = _session(model="vendor/local-model", provider="custom:vllm-local")
+
+    assert _repair(session, profile_provider="nous") == "custom:vllm-local"

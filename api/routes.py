@@ -6540,13 +6540,23 @@ def _catalog_group_owns_exact_model(group: dict, model: str) -> bool:
 def _stored_provider_can_legitimately_own_model(stored_provider: str) -> bool:
     """Return True when a catalog absence is not evidence against ownership.
 
-    Self-hosted and plugin providers serve arbitrary local/external models
-    that never appear in any catalog, and catalog discovery for them can
-    fail transiently -- a missing model there does not prove the stored
-    provider is stale (#7585 preserves the #5731 fail-safe for that class).
+    Self-hosted, plugin, and custom-endpoint providers serve arbitrary
+    local/external models that never appear in any catalog (vLLM or
+    llama-server behind a named ``custom_providers`` entry need no API key),
+    so a missing model there does not prove the stored provider is stale
+    (#7585 review; #5731 fail-safe).
     """
     provider = str(stored_provider or "").strip().lower()
     if provider in _SELF_HOSTED_PROVIDER_IDS:
+        return True
+    if provider == "custom" or provider.startswith("custom:"):
+        return True
+    try:
+        from api.config import _named_custom_provider_slug_for_provider
+
+        if _named_custom_provider_slug_for_provider(provider):
+            return True
+    except Exception:
         return True
     try:
         return bool(is_plugin_model_provider(provider))
@@ -6554,19 +6564,17 @@ def _stored_provider_can_legitimately_own_model(stored_provider: str) -> bool:
         return True
 
 
-def _catalog_evidence_is_incomplete(groups: list[dict]) -> bool:
-    """Return True when any catalog group failed discovery or was truncated.
+def _catalog_evidence_is_incomplete(catalog: dict, groups: list[dict]) -> bool:
+    """Return True when the catalog cannot prove anything about ownership.
 
-    An unverifiable catalog cannot prove non-ownership; only complete
-    negative evidence may clear a stale provider (#7585).
+    A cold/emergency minimal catalog lists only the active provider's
+    default model, and an errored group never discovered anything —
+    neither may clear a stale provider (#7585 and its review).
     """
+    if catalog.get("catalog_minimal"):
+        return True
     for group in groups:
         if group.get("models_endpoint_error"):
-            return True
-        try:
-            if int(group.get("models_total") or 0) > len(group.get("models") or []):
-                return True
-        except (TypeError, ValueError):
             return True
     return False
 
@@ -6642,7 +6650,7 @@ def _repair_foreign_session_model_provider(
         # or credential-live stored lane stays fail-safe preserved (#5731).
         if _stored_provider_can_legitimately_own_model(stored_provider):
             return resolved_provider
-        if _catalog_evidence_is_incomplete(groups):
+        if _catalog_evidence_is_incomplete(catalog, groups):
             return resolved_provider
         if _stored_provider_has_live_credential(stored_provider):
             return resolved_provider
