@@ -58,6 +58,22 @@ def no_plugin_providers(monkeypatch):
     monkeypatch.setattr(routes, "is_plugin_model_provider", lambda _pid: False, raising=False)
 
 
+@pytest.fixture()
+def no_provider_credentials(monkeypatch):
+    """No provider of any kind has a usable API credential.
+
+    Unlike ``no_openrouter_credential`` (which keeps other lanes live), the
+    keyless-local cases under test must have *every* lane credential-dead, so a
+    lane is preserved only by the legitimately-keyless / base_url rules and not by
+    a surviving credential fallback (PR #7594 review).
+    """
+    monkeypatch.setattr(
+        routes, "provider_has_usable_credential",
+        lambda _pid, **_kw: False,
+        raising=False,
+    )
+
+
 def test_stale_no_credential_provider_cleared_to_single_owner(
     monkeypatch, no_openrouter_credential, no_plugin_providers
 ):
@@ -189,3 +205,140 @@ def test_keyless_custom_endpoint_provider_stays_preserved(
     session = _session(model="vendor/local-model", provider="custom:vllm-local")
 
     assert _repair(session, profile_provider="nous") == "custom:vllm-local"
+
+
+# ---------------------------------------------------------------------------
+# PR #7594 review (CHANGES_REQUESTED): keyless LOCAL-server lanes beyond
+# ollama/lmstudio and any configured ``providers.<id>.base_url`` OpenAI-compatible
+# endpoint must be preserved even with no catalog group and no API key. The #7585
+# repair must never silently reassign a working self-hosted session to the catalog
+# owner, nor persist such a swap.
+# ---------------------------------------------------------------------------
+
+
+def test_raw_keyless_vllm_provider_preserved_without_catalog(
+    monkeypatch, no_provider_credentials, no_plugin_providers
+):
+    """A raw routable ``vllm`` lane (no catalog group, no key) must stay put.
+
+    vllm is a local model server (`_is_local_server_provider`): its models never
+    appear in any catalog, so the *absence* of a vllm group proves nothing.
+    Clearing it here would silently reassign a working self-hosted session to the
+    catalog owner (PR #7594 review, CORE).
+    """
+    _patch_catalog(monkeypatch, _catalog(_group("nous", "deepseek/deepseek-v4.1-flash")))
+
+    assert _repair(_session(provider="vllm")) == "vllm"
+
+
+def test_raw_keyless_llamacpp_provider_preserved_without_catalog(
+    monkeypatch, no_provider_credentials, no_plugin_providers
+):
+    """A raw ``llamacpp`` lane is likewise self-hosted and must be preserved."""
+    _patch_catalog(monkeypatch, _catalog(_group("nous", "deepseek/deepseek-v4.1-flash")))
+
+    assert _repair(_session(provider="llamacpp")) == "llamacpp"
+
+
+def test_raw_keyless_tabby_provider_preserved_without_catalog(
+    monkeypatch, no_provider_credentials, no_plugin_providers
+):
+    """``tabby`` (TabbyAPI) is another local server name in _LOCAL_SERVER_PROVIDERS."""
+    _patch_catalog(monkeypatch, _catalog(_group("nous", "deepseek/deepseek-v4.1-flash")))
+
+    assert _repair(_session(provider="tabby")) == "tabby"
+
+
+def _run_chat_start_local_lane(monkeypatch, tmp_path, *, session_id, provider, profile_cfg):
+    """Drive a real chat start for a session whose stored provider is ``provider``.
+
+    Returns (captured_kwargs_passed_to__start_run, session_provider_after, provider_before).
+    ``profile_cfg`` is the per-profile config returned by the (patched)
+    ``_read_profile_model_config``; it must keep the ``nous`` catalog owning the
+    stored model so a replacement would target it.
+    """
+    session = SimpleNamespace(
+        session_id=session_id,
+        workspace=str(tmp_path),
+        model="deepseek/deepseek-v4.1-flash",
+        model_provider=provider,
+        profile="default",
+        messages=[],
+        context_messages=[],
+        pending_user_message=None,
+        save=lambda: None,
+    )
+    provider_before = session.model_provider
+    captured = {}
+
+    def start_run(s, **kwargs):
+        captured.update(kwargs)
+        routes._prepare_chat_start_session_for_stream(
+            s,
+            msg=kwargs["msg"],
+            attachments=kwargs["attachments"],
+            workspace=kwargs["workspace"],
+            model=kwargs["model"],
+            model_provider=kwargs["model_provider"],
+            stream_id=session_id,
+        )
+        return {"stream_id": session_id}
+
+    monkeypatch.setattr(routes, "_get_or_materialize_session", lambda _sid, **_kwargs: session)
+    monkeypatch.setattr(routes, "_resolve_chat_workspace_with_recovery", lambda _s, _w: str(tmp_path))
+    monkeypatch.setattr(
+        routes,
+        "_read_profile_model_config",
+        lambda _s, _p: (None, None, profile_cfg or {"model": {"provider": "nous"}}),
+    )
+    _patch_catalog(monkeypatch, _catalog(_group("nous", "deepseek/deepseek-v4.1-flash")))
+    monkeypatch.setattr(routes, "_start_run", start_run)
+    monkeypatch.setattr(routes, "j", lambda _handler, payload, status=200: payload)
+
+    routes._handle_chat_start(None, {"session_id": session.session_id, "message": "continue"})
+
+    return captured, session.model_provider, provider_before
+
+
+def test_chat_start_keeps_keyless_local_vllm_lane_and_does_not_persist(
+    monkeypatch, tmp_path, no_provider_credentials, no_plugin_providers
+):
+    """End-to-end: a keyless raw ``vllm`` lane passes through chat start untouched.
+
+    The stored provider must not be silently swapped for the catalog owner and must
+    not be persisted as a different provider. Provider is identical before/after.
+    """
+    captured, provider_after, provider_before = _run_chat_start_local_lane(
+        monkeypatch, tmp_path, session_id="issue-7594-vllm", provider="vllm",
+        profile_cfg=None,
+    )
+
+    assert captured["model_provider"] == "vllm", captured["model_provider"]
+    assert provider_after == "vllm", provider_after
+    assert provider_before == provider_after
+
+
+def test_chat_start_keeps_configured_openai_compatible_base_url_lane(
+    monkeypatch, tmp_path, no_provider_credentials, no_plugin_providers
+):
+    """Any profile-scoped ``providers.<id>.base_url`` OpenAI-compatible endpoint is
+    preserved even with no catalog group and no key.
+
+    ``llama-server`` here is an arbitrary OpenAI-compatible id declared via
+    ``providers.llama-server.base_url``; its models are served without any catalog.
+    Chat start must keep the lane identical (no replace, no persist).
+    """
+    profile_cfg = {
+        "providers": {
+            "llama-server": {"base_url": "http://127.0.0.1:8080/v1"},
+        },
+        "model": {"provider": "nous"},
+    }
+    captured, provider_after, provider_before = _run_chat_start_local_lane(
+        monkeypatch, tmp_path, session_id="issue-7594-burl", provider="llama-server",
+        profile_cfg=profile_cfg,
+    )
+
+    assert captured["model_provider"] == "llama-server", captured["model_provider"]
+    assert provider_after == "llama-server", provider_after
+    assert provider_before == provider_after
