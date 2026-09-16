@@ -6537,6 +6537,47 @@ def _catalog_group_owns_exact_model(group: dict, model: str) -> bool:
     return False
 
 
+def _stored_provider_can_legitimately_own_model(stored_provider: str) -> bool:
+    """Return True when a catalog absence is not evidence against ownership.
+
+    Self-hosted and plugin providers serve arbitrary local/external models
+    that never appear in any catalog, and catalog discovery for them can
+    fail transiently -- a missing model there does not prove the stored
+    provider is stale (#7585 preserves the #5731 fail-safe for that class).
+    """
+    provider = str(stored_provider or "").strip().lower()
+    if provider in _SELF_HOSTED_PROVIDER_IDS:
+        return True
+    try:
+        return bool(is_plugin_model_provider(provider))
+    except Exception:
+        return True
+
+
+def _catalog_evidence_is_incomplete(groups: list[dict]) -> bool:
+    """Return True when any catalog group failed discovery or was truncated.
+
+    An unverifiable catalog cannot prove non-ownership; only complete
+    negative evidence may clear a stale provider (#7585).
+    """
+    for group in groups:
+        if group.get("models_endpoint_error"):
+            return True
+        try:
+            if int(group.get("models_total") or 0) > len(group.get("models") or []):
+                return True
+        except (TypeError, ValueError):
+            return True
+    return False
+
+
+def _stored_provider_has_live_credential(stored_provider: str) -> bool:
+    try:
+        return bool(provider_has_usable_credential(stored_provider))
+    except Exception:
+        return True
+
+
 def _repair_foreign_session_model_provider(
     session,
     *,
@@ -6585,11 +6626,26 @@ def _repair_foreign_session_model_provider(
         if str(group.get("provider_id") or "").strip().lower() == stored_provider
     ]
     if (
-        not stored_groups
-        or any(group.get("models_endpoint_error") for group in stored_groups)
+        any(group.get("models_endpoint_error") for group in stored_groups)
         or any(_catalog_group_owns_exact_model(group, stored_model) for group in stored_groups)
     ):
         return resolved_provider
+    if not stored_groups:
+        # A missing stored group used to preserve the lane unconditionally,
+        # which let a stale catalog-backed provider (e.g. "openrouter" left on
+        # a session after moving to another provider without an OpenRouter
+        # key) survive into every agent construction and re-trigger paid
+        # fallback probes (#7585). A catalog-backed provider is expected to
+        # have a group even with zero credentials, so its absence plus
+        # complete catalog evidence proves non-ownership. Self-hosted/plugin
+        # providers may legitimately own unlisted models, and an incomplete
+        # or credential-live stored lane stays fail-safe preserved (#5731).
+        if _stored_provider_can_legitimately_own_model(stored_provider):
+            return resolved_provider
+        if _catalog_evidence_is_incomplete(groups):
+            return resolved_provider
+        if _stored_provider_has_live_credential(stored_provider):
+            return resolved_provider
     owners = [
         group
         for group in groups
@@ -10591,10 +10647,13 @@ from api.run_journal import (
 )
 from api.todo_state import attach_todo_state
 from api.providers import (
+    _SELF_HOSTED_PROVIDER_IDS,
     get_providers,
     get_provider_quota,
     get_provider_cost_history,
+    is_plugin_model_provider,
     provider_has_process_wakeup_recovery_credential,
+    provider_has_usable_credential,
     set_provider_key,
     remove_provider_key,
 )
