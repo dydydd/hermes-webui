@@ -345,16 +345,17 @@ def test_chat_start_keeps_configured_openai_compatible_base_url_lane(
 
 
 # ---------------------------------------------------------------------------
-# PR #7594 review P1 (follow-up): TOP-LEVEL ``model.base_url`` local lane.
-# A profile config may declare the local endpoint at the TOP level
-# (FAQ-documented shape ``model: {provider: ..., base_url: http://127.0.0.1:...}``)
-# rather than nested under ``providers.<id>.base_url`` (which the previous fix
-# already honors). An arbitrary provider ID -- e.g. ``my-local-server`` -- routed
-# through a top-level loopback / private base_url, with no key and no catalog
-# group, must be preserved by the stale-provider repair: chat start must not
-# reassign it to the catalog owner and must not persist such a swap. The nested
-# providers.<id>.base_url check alone (already in production) does not catch the
-# top-level shape, so these tests pin the missing P1 lane.
+# PR #7594 review P1 (latest): a TOP-LEVEL ``model.base_url`` is ownership
+# evidence ONLY for the provider it is configured under.
+# ``model.base_url`` belongs to ``model.provider``. It must not make an
+# UNRELATED stored provider look like a legitimate local lane: when the
+# profile configures a loopback/private URL for provider X while the session
+# stores a different, keyless, catalog-less provider Y, the stale lane Y must
+# still be repaired to the sole catalog owner. When the stored provider IS the
+# configured provider (the FAQ shape ``model: {provider: my-local-server,
+# base_url: http://127.0.0.1:...}``), the same URL must keep preserving the
+# lane. A public URL is not local evidence for anybody, and no URL without a
+# configured provider owner is evidence at all. (Greptile P1, 2026-09-16.)
 # ---------------------------------------------------------------------------
 
 
@@ -380,18 +381,41 @@ def _repair_with_top_level(session, profile_cfg, *, provider="nous"):
         "http://10.0.0.7:8080/v1",
     ],
 )
-def test_top_level_model_base_url_arbitrary_provider_preserved_without_catalog(
+def test_top_level_base_url_for_foreign_provider_does_not_preserve_stale_lane(
     monkeypatch, no_provider_credentials, no_plugin_providers, base_url
 ):
-    """A TOP-LEVEL model.base_url (loopback/private) must preserve an arbitrary
-    stored provider ID even with no catalog group and no API key (P1)."""
+    """Repro (latest P1): ``model.base_url`` is evidence for ``model.provider``
+    ONLY. A loopback/private URL configured for ``nous`` while the session
+    stores an UNRELATED keyless, catalog-less ``my-local-server`` must NOT
+    protect that stale lane: the repair still reassigns it to the sole catalog
+    owner."""
     _patch_catalog(monkeypatch, _catalog(_group("nous", "deepseek/deepseek-v4.1-flash")))
     profile_config = {"model": {"provider": "nous", "base_url": base_url}}
     session = _session(provider="my-local-server")
 
     result = _repair_with_top_level(session, profile_config)
 
-    assert result == "my-local-server", result
+    assert result == "nous", result
+
+
+def test_top_level_base_url_evidence_requires_matching_configured_provider(
+    no_plugin_providers,
+):
+    """Unit face of the same contract, via _stored_provider_can_legitimately_own_model.
+
+    Match (case/whitespace-insensitive) -> True; configured provider differing
+    from the stored provider -> False; a URL with NO configured provider at all
+    is ownership evidence for nobody -> False (strictest defensible reading of
+    "normalized provider matches the stored provider").
+    """
+    local = "http://127.0.0.1:8000/v1"
+    own = routes._stored_provider_can_legitimately_own_model
+    assert own(
+        "my-local-server", {"model": {"provider": "my-local-server", "base_url": local}}
+    ) is True
+    assert own("my-local-server", {"model": {"provider": " My-Local-Server ", "base_url": local}}) is True
+    assert own("my-local-server", {"model": {"provider": "nous", "base_url": local}}) is False
+    assert own("my-local-server", {"model": {"base_url": local}}) is False
 
 
 def test_top_level_model_base_url_arbitrary_provider_preserved_when_default_provider_matches(
@@ -411,21 +435,23 @@ def test_top_level_model_base_url_arbitrary_provider_preserved_when_default_prov
     assert result == "my-local-server", result
 
 
-def test_chat_start_keeps_top_level_base_url_lane_and_does_not_persist(
+def test_chat_start_repairs_foreign_lane_behind_another_provider_top_level_base_url(
     monkeypatch, tmp_path, no_provider_credentials, no_plugin_providers
 ):
-    """End-to-end: a session stored under an arbitrary provider ID whose profile
-    declares a TOP-LEVEL model.base_url loopback passes through chat start
-    untouched -- no swap to the catalog owner, no persisted rewrite."""
+    """End-to-end (latest P1): a profile whose TOP-LEVEL model.base_url loopback
+    belongs to ``nous`` must not keep an unrelated stored ``my-local-server``
+    alive. Chat start must repair the lane to the sole catalog owner and
+    persist that provider -- the wrong-lane session may not keep routing
+    through a provider nobody configured a lane for."""
     profile_cfg = {"model": {"provider": "nous", "base_url": "http://127.0.0.1:8080/v1"}}
     captured, provider_after, provider_before = _run_chat_start_local_lane(
         monkeypatch, tmp_path, session_id="issue-7594-topburl", provider="my-local-server",
         profile_cfg=profile_cfg,
     )
 
-    assert captured["model_provider"] == "my-local-server", captured["model_provider"]
-    assert provider_after == "my-local-server", provider_after
-    assert provider_before == provider_after
+    assert provider_before == "my-local-server"
+    assert captured["model_provider"] == "nous", captured["model_provider"]
+    assert provider_after == "nous", provider_after
 
 
 def test_top_level_public_base_url_does_not_preserve_stale_lane(
